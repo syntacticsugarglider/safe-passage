@@ -19,12 +19,34 @@ fn main() {
                 .expect("no EZVIZ_VERIFICATION_CODE env var specified"),
             addr
         );
-        let playbin = gst::ElementFactory::make("playbin", None).unwrap();
-        playbin.set_property("uri", &uri).unwrap();
-        let bus = playbin.get_bus().unwrap();
-        playbin.set_state(gst::State::Playing).unwrap();
+        let pipeline = gst::Pipeline::new(None);
+        let src = gst::ElementFactory::make("rtspsrc", Some("source")).unwrap();
+
+        src.set_property("location", &uri).unwrap();
+        src.set_property("latency", &100u32).unwrap();
+
+        let rtp_extract = gst::ElementFactory::make("rtph264depay", None).unwrap();
+        let video_decode = gst::ElementFactory::make("avdec_h264", None).unwrap();
+        let sink = gst::ElementFactory::make("autovideosink", None).unwrap();
+        pipeline
+            .add_many(&[&src, &rtp_extract, &video_decode, &sink])
+            .unwrap();
+        rtp_extract.link(&video_decode).unwrap();
+        video_decode.link(&sink).unwrap();
+
+        src.connect_pad_added(move |_, src_pad| {
+            let sink_pad = rtp_extract.get_static_pad("sink").unwrap();
+            if !sink_pad.is_linked() {
+                src_pad.link(&sink_pad).unwrap();
+            }
+        });
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let bus = pipeline
+            .get_bus()
+            .expect("Pipeline without bus. Shouldn't happen!");
         bus.iter_timed(gst::CLOCK_TIME_NONE).for_each(drop);
-        playbin
+        pipeline
             .set_state(gst::State::Null)
             .expect("Unable to set the pipeline to the `Null` state");
     })
