@@ -1,7 +1,37 @@
+use futures::channel::mpsc::unbounded;
+use futures::Stream;
+use gst::gst_element_error;
+use gst::prelude::*;
 use serde::{de, Deserialize, Serialize};
-use std::{collections::HashMap, convert::TryFrom, convert::TryInto, fmt::Debug, net::IpAddr};
+use std::{
+    collections::HashMap, convert::TryFrom, convert::TryInto, fmt::Debug, iter, net::IpAddr,
+};
 use surf::{Body, Response};
 use thiserror::Error;
+
+fn yuv420p_to_rgb(buf: &[u8]) -> Vec<u8> {
+    let w = 1280;
+    let h = 720;
+    let total = w * h;
+    let total_quad = total + total / 4;
+    (0..h)
+        .map(|y| (0..w).map(move |x| (x, y)))
+        .flatten()
+        .map(|(x, y)| {
+            let co_y = buf[y * w + x] as f32;
+            let offset = (y / 2) * (w / 2) + (x / 2);
+            let co_u = buf[offset + total] as f32;
+            let co_v = buf[offset + total_quad] as f32;
+            let b = 1.164 * (co_y - 16.) + 2.018 * (co_u - 128.);
+            let g = 1.164 * (co_y - 16.) - 0.813 * (co_v - 128.) - 0.391 * (co_u - 128.);
+            let r = 1.164 * (co_y - 16.) + 1.596 * (co_v - 128.);
+            iter::once(r as u8)
+                .chain(iter::once(g as u8))
+                .chain(iter::once(b as u8))
+        })
+        .flatten()
+        .collect()
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -226,4 +256,109 @@ impl EzvizApi {
         .recv_json::<DevicesResponse>()
         .await?.try_into()?)
     }
+}
+
+pub fn camera_stream(
+    addr: IpAddr,
+    verification_code: String,
+) -> impl Stream<Item = image::ImageBuffer<image::Rgb<u8>, Vec<u8>>> {
+    let (sender, receiver) = unbounded();
+    let verification_code = verification_code.to_owned();
+    std::thread::spawn(move || {
+        gst::init().unwrap();
+        let uri = format!(
+            "rtsp://admin:{}@{}:554/h264_stream",
+            verification_code, addr
+        );
+        let pipeline = gst::Pipeline::new(None);
+        let src = gst::ElementFactory::make("rtspsrc", Some("source")).unwrap();
+
+        src.set_property("location", &uri).unwrap();
+        src.set_property("latency", &100u32).unwrap();
+
+        let rtp_extract = gst::ElementFactory::make("rtph264depay", None).unwrap();
+        let video_decode = gst::ElementFactory::make("avdec_h264", None).unwrap();
+        let video_rate = gst::ElementFactory::make("videorate", None).unwrap();
+        let video_convert = gst::ElementFactory::make("videoconvert", None).unwrap();
+
+        video_rate.set_property("max-rate", &1).unwrap();
+        video_rate.set_property("drop-only", &true).unwrap();
+
+        let sink = gst::ElementFactory::make("appsink", None).unwrap();
+
+        pipeline
+            .add_many(&[
+                &src,
+                &rtp_extract,
+                &video_decode,
+                &video_rate,
+                &video_convert,
+                &sink,
+            ])
+            .unwrap();
+        rtp_extract.link(&video_decode).unwrap();
+        video_decode.link(&video_rate).unwrap();
+        video_rate.link(&video_convert).unwrap();
+        video_convert.link(&sink).unwrap();
+
+        let appsink = sink
+            .dynamic_cast::<gst_app::AppSink>()
+            .expect("Sink element is expected to be an appsink!");
+        appsink.set_caps(Some(&gst::Caps::new_simple("video/x-raw", &[])));
+
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |appsink| {
+                    let sample = appsink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buffer = sample.get_buffer().ok_or_else(|| {
+                        gst_element_error!(
+                            appsink,
+                            gst::ResourceError::Failed,
+                            ("Failed to get buffer from appsink")
+                        );
+
+                        gst::FlowError::Error
+                    })?;
+                    let map = buffer.map_readable().map_err(|_| {
+                        gst_element_error!(
+                            appsink,
+                            gst::ResourceError::Failed,
+                            ("Failed to map buffer readable")
+                        );
+
+                        gst::FlowError::Error
+                    })?;
+                    sender
+                        .unbounded_send(
+                            image::ImageBuffer::<image::Rgb<u8>, Vec<u8>>::from_raw(
+                                1280,
+                                720,
+                                yuv420p_to_rgb(map.as_slice()),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+
+        src.connect_pad_added(move |_, src_pad| {
+            let sink_pad = rtp_extract.get_static_pad("sink").unwrap();
+            if !sink_pad.is_linked() {
+                src_pad.link(&sink_pad).unwrap();
+            }
+        });
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let bus = pipeline
+            .get_bus()
+            .expect("Pipeline without bus. Shouldn't happen!");
+        bus.iter_timed(gst::CLOCK_TIME_NONE).for_each(drop);
+        pipeline
+            .set_state(gst::State::Null)
+            .expect("Unable to set the pipeline to the `Null` state");
+    });
+
+    receiver
 }
