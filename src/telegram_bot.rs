@@ -90,16 +90,122 @@ async fn main() {
     tokio::spawn({
         let api = api.clone();
         let photos = photos.clone();
+        let db = db.clone();
         async move {
             while let Some(Ok(update)) = stream.next().await {
                 match update.kind {
+                    UpdateKind::CallbackQuery(callback) => {
+                        tokio::spawn({
+                            let photos = photos.clone();
+                            let db = db.clone();
+                            let api = api.clone();
+                            async move {
+                                let admins = api
+                                    .lock()
+                                    .await
+                                    .send(GetChatAdministrators::new(group))
+                                    .await
+                                    .unwrap();
+                                if admins.into_iter().any(|member| {
+                                    member.user.to_user_id() == callback.from.to_user_id()
+                                }) {
+                                    if let Some("Yes") = callback.data.as_ref().map(String::as_ref)
+                                    {
+                                        photos.lock().await.clear();
+                                        db.lock().await.clear().unwrap();
+                                        api.lock()
+                                            .await
+                                            .send(callback.answer("Database reset"))
+                                            .await
+                                            .unwrap();
+                                        api.lock()
+                                            .await
+                                            .send(DeleteMessage::new(
+                                                callback.message.as_ref().unwrap().to_source_chat(),
+                                                callback.message.as_ref().unwrap(),
+                                            ))
+                                            .await
+                                            .unwrap();
+                                    } else {
+                                        api.lock()
+                                            .await
+                                            .send(callback.answer("Cancelled"))
+                                            .await
+                                            .unwrap();
+                                        api.lock()
+                                            .await
+                                            .send(DeleteMessage::new(
+                                                callback.message.as_ref().unwrap().to_source_chat(),
+                                                callback.message.as_ref().unwrap(),
+                                            ))
+                                            .await
+                                            .unwrap();
+                                    }
+                                }
+                            }
+                        });
+                    }
                     UpdateKind::Message(message) => match &message.kind {
                         MessageKind::Text {
                             data: query,
                             entities: _,
                         } => {
-                            let chat = message.chat;
-                            if chat.to_chat_ref() != group.to_chat_ref() {
+                            let query = query.to_lowercase();
+                            if message.chat.to_chat_ref() != group.to_chat_ref() {
+                                continue;
+                            }
+                            let command = query.split('@').next().unwrap();
+                            if command == "/count" {
+                                let _ = api
+                                    .lock()
+                                    .await
+                                    .send(
+                                        SendMessage::new(
+                                            message.chat.clone(),
+                                            format!(
+                                                "{} photos in database",
+                                                photos.lock().await.len()
+                                            ),
+                                        )
+                                        .reply_to(message),
+                                    )
+                                    .await;
+                                continue;
+                            }
+                            if command == "/reset" || command == "/clear" {
+                                tokio::spawn({
+                                    let api = api.clone();
+                                    async move {
+                                        let admins = api
+                                            .lock()
+                                            .await
+                                            .send(GetChatAdministrators::new(group))
+                                            .await
+                                            .unwrap();
+                                        if let Some(user) = admins
+                                            .into_iter()
+                                            .filter(|member| member.user == message.from)
+                                            .take(1)
+                                            .next()
+                                        {
+                                            api.lock()
+                                            .await
+                                            .send(
+                                                SendMessage::new(
+                                                    user,
+                                                    "Are you sure you want to clear the database?",
+                                                )
+                                                .reply_markup(ReplyMarkup::InlineKeyboardMarkup({
+                                                    let mut kb = InlineKeyboardMarkup::new();
+                                                    kb.add_row(vec!["Yes", "No"].into_iter().map(|item| InlineKeyboardButton::callback(item, item)).collect());
+                                                    kb
+                                                })),
+                                            )
+                                            .await
+                                            .unwrap();
+                                        };
+                                    }
+                                });
                                 continue;
                             }
                             let chat = message.from;
